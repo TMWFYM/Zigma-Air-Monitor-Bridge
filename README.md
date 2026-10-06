@@ -51,7 +51,7 @@ Supports both **Home Assistant OS / Supervised Add-on** and **Standalone Docker 
 ### Method A: Custom Add-on Repository (Recommended)
 1. In Home Assistant, go to **Settings** -> **Add-ons** -> **Add-on Store**.
 2. Click the three dots in the top right corner and select **Repositories**.
-3. Add the repository URL: `https://github.com/your-username/homeassistant-zigma`
+3. Add the repository URL: `[https://github.com/TMWFYM/Zigma-Air-Monitor-Bridge](https://github.com/TMWFYM/Zigma-Air-Monitor-Bridge)`
 4. Refresh the Add-on Store, find **Zigma Aerio 300 Purifier**, and click **Install**.
 5. Go to the **Configuration** tab, enter your Zigma `account` and `password`, and click **Save**.
 6. Start the add-on and enable **Start on boot** and **Watchdog**.
