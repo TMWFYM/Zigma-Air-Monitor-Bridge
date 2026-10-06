@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3
+- Fixed fan speed control: mapped discrete speed levels (1, 2, 3) and percentage inputs to purifier fan levels.
+- Updated Home Assistant MQTT fan percentage template to match configured `speed_range_min` and `speed_range_max`.
+- Fixed preset mode template string comparisons for `sleep` and `auto` modes.
+- Turning speed to 0% now turns purifier off, and setting a speed takes device out of sleep mode.
+
 ## 1.0.2
 - Integrated Grit Cloud Weather API to dynamically query live outdoor PM2.5 based on registered device coordinates.
 - Replaces static/cached shadow outdoor PM2.5 with live meteorology station reports matching the official Zigma app.

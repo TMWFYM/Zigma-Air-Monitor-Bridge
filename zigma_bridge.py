@@ -423,7 +423,7 @@ class HomeAssistantBridge:
         logger.info("Publishing Home Assistant MQTT Auto-Discovery entities for %s...", self.thing_name)
 
         fan_config = {
-            "name": "Air Purifier",
+            "name": self.nickname,
             "unique_id": f"zigma_{self.thing_name}_fan",
             "state_topic": self.state_topic,
             "command_topic": f"{MQTT_TOPIC_PREFIX}/power/set",
@@ -432,12 +432,12 @@ class HomeAssistantBridge:
             "payload_off": "OFF",
             "percentage_state_topic": self.state_topic,
             "percentage_command_topic": f"{MQTT_TOPIC_PREFIX}/speed/set",
-            "percentage_value_template": "{{ ((value_json.fan_level / 3) * 100) | round }}",
+            "percentage_value_template": "{{ value_json.fan_level }}",
             "speed_range_min": 1,
             "speed_range_max": 3,
             "preset_mode_state_topic": self.state_topic,
             "preset_mode_command_topic": f"{MQTT_TOPIC_PREFIX}/preset_mode/set",
-            "preset_mode_value_template": "{% if value_json.sleep_mode == on %}sleep{% elif value_json.fan_mode == auto %}auto{% else %}manual{% endif %}",
+            "preset_mode_value_template": "{% if value_json.sleep_mode == 'on' %}sleep{% elif value_json.fan_mode == 'auto' %}auto{% else %}manual{% endif %}",
             "preset_modes": ["manual", "auto", "sleep"],
             "availability_topic": self.availability_topic,
             "device": self.device_info,
@@ -600,16 +600,26 @@ class HomeAssistantBridge:
 
         elif topic == f"{MQTT_TOPIC_PREFIX}/speed/set":
             try:
-                pct = int(payload)
-                if pct <= 33:
-                    lvl = 1
-                elif pct <= 66:
-                    lvl = 2
+                val = int(float(payload))
+                if val <= 0:
+                    self.zigma.send_command({"working_status": "off"})
                 else:
-                    lvl = 3
-                self.zigma.send_command({"working_status": "on", "fan_level": lvl, "fan_mode": "hand"})
+                    if val <= 3:
+                        lvl = val
+                    elif val <= 33:
+                        lvl = 1
+                    elif val <= 66:
+                        lvl = 2
+                    else:
+                        lvl = 3
+                    self.zigma.send_command({
+                        "working_status": "on",
+                        "fan_level": lvl,
+                        "fan_mode": "hand",
+                        "sleep_mode": "off",
+                    })
             except ValueError:
-                logger.error("Invalid speed percentage: %s", payload)
+                logger.error("Invalid speed value: %s", payload)
 
         elif topic == f"{MQTT_TOPIC_PREFIX}/preset_mode/set":
             mode = payload.lower()
