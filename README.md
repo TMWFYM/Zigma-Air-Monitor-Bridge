@@ -38,6 +38,7 @@ Supports both **Home Assistant OS / Supervised Add-on** and **Standalone Docker 
 |---|---|---|
 | `Air Purifier` | `fan` | Main fan entity: Power, Speed %, Preset modes (manual, auto, sleep) |
 | `PM2.5` | `sensor` | Indoor air quality particulate sensor (µg/m³) |
+| `Outdoor PM2.5` | `sensor` | Real-time outdoor air quality from local weather stations (µg/m³) |
 | `Filter Element Life` | `sensor` | Remaining filter element life percentage (%) |
 | `Fan Speed RPM` | `sensor` | Real-time motor rotation speed |
 | `Air Quality Indicator Lamp` | `sensor` | Ring lamp color status |
@@ -51,7 +52,7 @@ Supports both **Home Assistant OS / Supervised Add-on** and **Standalone Docker 
 ### Method A: Custom Add-on Repository (Recommended)
 1. In Home Assistant, go to **Settings** -> **Add-ons** -> **Add-on Store**.
 2. Click the three dots in the top right corner and select **Repositories**.
-3. Add the repository URL: `[https://github.com/TMWFYM/Zigma-Air-Monitor-Bridge]`
+3. Add the repository URL: `https://github.com/TMWFYM/Zigma-Air-Monitor-Bridge`
 4. Refresh the Add-on Store, find **Zigma Aerio 300 Purifier**, and click **Install**.
 5. Go to the **Configuration** tab, enter your Zigma `account` and `password`, and click **Save**.
 6. Start the add-on and enable **Start on boot** and **Watchdog**.

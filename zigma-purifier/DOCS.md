@@ -52,6 +52,7 @@ Once started, the add-on automatically registers the following entities in Home 
 |---|---|---|
 | `Air Purifier` | `fan` | Main purifier entity (Power, Speed %, Modes: manual, auto, sleep) |
 | `PM2.5` | `sensor` | Indoor air quality particulate count (µg/m³) |
+| `Outdoor PM2.5` | `sensor` | Real-time outdoor air quality from local weather stations (µg/m³) |
 | `Filter Element Life` | `sensor` | Remaining filter lifespan percentage (%) |
 | `Fan Speed RPM` | `sensor` | Real-time motor rotation speed |
 | `Air Quality Indicator Lamp` | `sensor` | Ring lamp color status |
