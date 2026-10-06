@@ -1,0 +1,7 @@
+services:
+  zigma-bridge:
+    build: ./zigma-purifier
+    container_name: zigma-aerio300-bridge
+    restart: unless-stopped
+    env_file:
+      - .env

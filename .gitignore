@@ -1,0 +1,23 @@
+# Environment & Secrets
+.env
+*.pem
+*.key
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+venv/
+.venv/
+
+# Local Dev & Reverse Engineering Scratch
+dev/
+backup_safe/
+*.swp
+*.swo
+*~
+.*.kate-swp
+
+# Allow Add-on store icons
+!zigma-purifier/*.png

@@ -1,0 +1,34 @@
+configuration:
+  account:
+    name: "Zigma Account"
+    description: "Your Zigma login phone number or email address"
+  password:
+    name: "Zigma Password"
+    description: "Your Zigma account password"
+  calling_code:
+    name: "Calling Code"
+    description: "Country calling code (e.g. 001 for US/Canada, 044 for UK)"
+  jwt_token:
+    name: "JWT Token (Optional)"
+    description: "Static JWT token if you prefer not to use account credentials"
+  thing_name:
+    name: "Device Name / Thing Name (Optional)"
+    description: "Leave blank to automatically discover your purifier"
+  mqtt_host:
+    name: "MQTT Host"
+    description: "Hostname of your MQTT broker (default: core-mosquitto for HA Mosquitto)"
+  mqtt_port:
+    name: "MQTT Port"
+    description: "Port of your MQTT broker"
+  mqtt_user:
+    name: "MQTT Username"
+    description: "Username for MQTT broker (optional)"
+  mqtt_password:
+    name: "MQTT Password"
+    description: "Password for MQTT broker (optional)"
+  region:
+    name: "Region"
+    description: "Zigma cloud region (default: ap-southeast-1)"
+  sync_interval:
+    name: "Sync Interval in seconds (Default 15)"
+    description: "How often to poll device telemetry (in seconds)"

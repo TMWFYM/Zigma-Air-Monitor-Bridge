@@ -1,0 +1,39 @@
+name: "Zigma Aerio 300 Purifier"
+description: "Home Assistant MQTT bridge and real-time telemetry for Zigma Aerio 300 air purifiers"
+version: "1.0.2"
+slug: "zigma_purifier"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+services:
+  - "mqtt:want"
+options:
+  account: ""
+  password: ""
+  calling_code: "001"
+  jwt_token: ""
+  thing_name: ""
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  region: "ap-southeast-1"
+  sync_interval: 15
+schema:
+  account: str?
+  password: password?
+  calling_code: str?
+  jwt_token: str?
+  thing_name: str?
+  mqtt_host: str?
+  mqtt_port: port?
+  mqtt_user: str?
+  mqtt_password: password?
+  region: str?
+  sync_interval: int?
