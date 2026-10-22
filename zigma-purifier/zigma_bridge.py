@@ -4,7 +4,7 @@ Zigma Aerio 300 <-> Home Assistant MQTT Bridge
 Bi-directional real-time telemetry streaming and control over MQTT.
 Supports Home Assistant Add-on (/data/options.json), Docker, and standalone execution.
 Supports both static JWT token and automated username/password login.
-Auto-discovers purifiers on account if no device ID is specified.
+Auto-discovers all purifiers on account and persists device ordering across restarts.
 Periodically fetches live outdoor air quality from Grit Cloud weather service.
 """
 
@@ -82,9 +82,16 @@ OAUTH_URL = get_config("oauth_url", "OAUTH_URL", "https://zigma.grit-cloud.com/p
 API_URL = get_config("api_url", "API_URL", "https://zigma.grit-cloud.com/prod/api")
 WSS_URL = get_config("wss_url", "WSS_URL", "wss://zigma.grit-cloud.com/prod/wss")
 
+# Persistent device order mapping path
+DEVICE_MAP_PATH = (
+    "/data/device_map.json"
+    if os.path.isdir("/data") and os.access("/data", os.W_OK)
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_map.json")
+)
+
 
 class TokenManager:
-    """Manages JWT tokens: checks validity and falls back to username/password login."""
+    """Manages JWT tokens thread-safely: checks validity and falls back to username/password login."""
 
     def __init__(self, static_token="", account="", password="", calling_code="001"):
         self.static_token = static_token.strip()
@@ -93,6 +100,7 @@ class TokenManager:
         self.calling_code = calling_code.strip()
         self.active_token = self.static_token
         self.token_expiry = 0
+        self.lock = threading.Lock()
 
         if self.static_token:
             self._parse_token_expiry(self.static_token)
@@ -115,6 +123,12 @@ class TokenManager:
             remaining = self.token_expiry - time.time()
             return remaining > min_ttl
         return True
+
+    def invalidate_token(self, failed_token: str):
+        with self.lock:
+            if self.account and self.password and self.active_token == failed_token:
+                self.token_expiry = 0
+                self.active_token = ""
 
     def login_with_credentials(self) -> str:
         if not self.account or not self.password:
@@ -158,29 +172,30 @@ class TokenManager:
         return ""
 
     def get_token(self) -> str:
-        # 1. If static token is provided and still valid, use it
-        if self.static_token and self.is_token_valid(self.static_token):
-            return self.static_token
+        with self.lock:
+            # 1. If static token is provided and still valid, use it
+            if self.static_token and self.is_token_valid(self.static_token):
+                return self.static_token
 
-        # 2. If active token is valid, use it
-        if self.active_token and self.is_token_valid(self.active_token):
-            return self.active_token
+            # 2. If active token is valid, use it
+            if self.active_token and self.is_token_valid(self.active_token):
+                return self.active_token
 
-        # 3. Token missing or expired: log in with credentials
-        if self.account and self.password:
-            logger.info("Static JWT token missing or expired. Authenticating with account credentials...")
-            token = self.login_with_credentials()
-            if token:
-                return token
+            # 3. Token missing or expired: log in with credentials
+            if self.account and self.password:
+                logger.info("Static JWT token missing or expired. Authenticating with account credentials...")
+                token = self.login_with_credentials()
+                if token:
+                    return token
 
-        # 4. Fallback to static token even if validity cannot be guaranteed
-        if self.static_token:
-            logger.info("Using configured static JWT token as fallback.")
-            self.active_token = self.static_token
-            return self.static_token
+            # 4. Fallback to static token even if validity cannot be guaranteed
+            if self.static_token:
+                logger.info("Using configured static JWT token as fallback.")
+                self.active_token = self.static_token
+                return self.static_token
 
-        logger.error("No valid JWT token or credentials available!")
-        return ""
+            logger.error("No valid JWT token or credentials available!")
+            return ""
 
 
 def auto_discover_things(token: str, region: str) -> list:
@@ -200,7 +215,19 @@ def auto_discover_things(token: str, region: str) -> list:
     return []
 
 
+# Shared weather cache across devices at the same coordinates
+_weather_cache_lock = threading.Lock()
+_weather_cache = {}  # (lat_round, lon_round) -> (timestamp, pm2p5)
+
+
 def get_outdoor_weather(token: str, lat: float, lon: float, region: str = "ap-southeast-1") -> dict:
+    key = (round(lat, 2), round(lon, 2))
+    now = time.time()
+    with _weather_cache_lock:
+        cached = _weather_cache.get(key)
+        if cached and (now - cached[0] < 600):
+            return {"pm2p5": cached[1]}
+
     headers = {
         "token": token,
         "region": region,
@@ -216,18 +243,189 @@ def get_outdoor_weather(token: str, lat: float, lon: float, region: str = "ap-so
         r = requests.post(API_URL, headers=headers, json=body, timeout=5)
         data = r.json()
         if data.get("code") == 1 and "data" in data:
-            return data["data"]
+            w = data["data"]
+            if w and "pm2p5" in w:
+                with _weather_cache_lock:
+                    _weather_cache[key] = (now, w["pm2p5"])
+                logger.info("Live Outdoor PM2.5 updated from weather service: %s µg/m³", w["pm2p5"])
+            return w
     except Exception as e:
         logger.debug("Failed to query Grit Cloud weather API: %s", e)
     return {}
 
 
+def load_device_map() -> dict:
+    """Load persistent thing_name -> metadata mapping from disk."""
+    if os.path.exists(DEVICE_MAP_PATH):
+        try:
+            with open(DEVICE_MAP_PATH, "r") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                normalized = {}
+                for k, v in raw.items():
+                    if isinstance(v, int):
+                        normalized[k] = {"index": v}
+                    elif isinstance(v, dict) and isinstance(v.get("index"), int):
+                        normalized[k] = v
+                return normalized
+        except Exception as e:
+            logger.warning("Failed to load device map from %s: %s", DEVICE_MAP_PATH, e)
+    return {}
+
+
+def save_device_map(device_map: dict):
+    """Persist thing_name -> metadata mapping to disk so restarts never swap HA objects."""
+    try:
+        with open(DEVICE_MAP_PATH, "w") as f:
+            json.dump(device_map, f, indent=2, sort_keys=True)
+    except Exception as e:
+        logger.warning("Could not write device map to %s: %s", DEVICE_MAP_PATH, e)
+
+
+def resolve_devices(discovered_devices: list, configured_thing_names: list) -> list:
+    """
+    Build an ordered list of device dicts with stable 1-based `index` assignments.
+    Guarantees that across restarts (even if cloud API returns devices in a different order),
+    each physical purifier stays permanently assigned to its Home Assistant device & entities.
+    """
+    device_map = load_device_map()
+
+    # Filter discovered devices to Aerio purifiers if present, else all discovered devices
+    if discovered_devices:
+        matched = [
+            d for d in discovered_devices
+            if "aerio" in d.get("sub_type", "").lower() or "aerio" in d.get("thing_name", "").lower()
+        ]
+        candidate_list = matched if matched else discovered_devices
+    else:
+        candidate_list = []
+
+    by_name = {}
+    for d in candidate_list:
+        t_name = d.get("thing_name")
+        if not t_name:
+            continue
+        coords = d.get("lng_lat") or {}
+        lat, lon = None, None
+        try:
+            if coords.get("latitude") is not None and coords.get("longitude") is not None:
+                lat = float(coords.get("latitude"))
+                lon = float(coords.get("longitude"))
+        except (TypeError, ValueError):
+            pass
+
+        by_name[t_name] = {
+            "thing_name": t_name,
+            "sub_type": d.get("sub_type") or SUB_TYPE or "aerio-300",
+            "nickname": d.get("thing_nickname") or "Air Purifier",
+            "model": d.get("model") or "Aerio 300",
+            "lat": lat,
+            "lon": lon,
+        }
+
+    # Ensure any explicitly configured thing_name(s) are also present
+    for t_name in configured_thing_names:
+        if t_name not in by_name:
+            saved = device_map.get(t_name, {})
+            by_name[t_name] = {
+                "thing_name": t_name,
+                "sub_type": saved.get("sub_type") or SUB_TYPE or "aerio-300",
+                "nickname": saved.get("nickname") or "Air Purifier",
+                "model": saved.get("model") or "Aerio 300",
+                "lat": saved.get("lat"),
+                "lon": saved.get("lon"),
+            }
+
+    # If discovery returned nothing and no THING_NAME was configured, fall back to saved device_map
+    if not by_name and device_map:
+        logger.warning("Cloud discovery returned no devices; falling back to saved device map (%s).", DEVICE_MAP_PATH)
+        for t_name, saved in device_map.items():
+            by_name[t_name] = {
+                "thing_name": t_name,
+                "sub_type": saved.get("sub_type") or SUB_TYPE or "aerio-300",
+                "nickname": saved.get("nickname") or "Air Purifier",
+                "model": saved.get("model") or "Aerio 300",
+                "lat": saved.get("lat"),
+                "lon": saved.get("lon"),
+            }
+
+    if not by_name:
+        return []
+
+    # Share fallback coordinates across devices on the same account if one device lacks coordinates
+    fallback_lat, fallback_lon = None, None
+    for info in by_name.values():
+        if info["lat"] is not None and info["lon"] is not None:
+            fallback_lat, fallback_lon = info["lat"], info["lon"]
+            break
+
+    used_indices = set()
+    for t_name, saved in device_map.items():
+        idx = saved.get("index")
+        if isinstance(idx, int) and idx >= 1:
+            used_indices.add(idx)
+
+    # Determine order for any newly seen devices not yet in device_map:
+    # 1. Explicitly configured thing_name(s) in configured order
+    # 2. Remaining devices sorted deterministically by thing_name (hardware ID)
+    unmapped_names = [t for t in by_name if t not in device_map]
+    unmapped_ordered = []
+    for t in configured_thing_names:
+        if t in unmapped_names and t not in unmapped_ordered:
+            unmapped_ordered.append(t)
+    for t in sorted(unmapped_names):
+        if t not in unmapped_ordered:
+            unmapped_ordered.append(t)
+
+    next_idx = 1
+    for t_name in unmapped_ordered:
+        while next_idx in used_indices:
+            next_idx += 1
+        device_map[t_name] = {"index": next_idx}
+        used_indices.add(next_idx)
+        next_idx += 1
+
+    # Sync metadata into device_map and build final resolved list
+    resolved = []
+    for t_name, info in by_name.items():
+        idx = device_map[t_name]["index"]
+        if info["lat"] is None and fallback_lat is not None:
+            info["lat"] = fallback_lat
+            info["lon"] = fallback_lon
+        info["index"] = idx
+        device_map[t_name] = {
+            "index": idx,
+            "sub_type": info["sub_type"],
+            "nickname": info["nickname"],
+            "model": info["model"],
+            "lat": info["lat"],
+            "lon": info["lon"],
+        }
+        resolved.append(info)
+
+    save_device_map(device_map)
+    resolved.sort(key=lambda d: d["index"])
+    return resolved
+
+
 class ZigmaClient:
-    def __init__(self, thing_name, sub_type, on_state_update, token_manager: TokenManager, lat=None, lon=None):
+    def __init__(
+        self,
+        thing_name,
+        sub_type,
+        on_state_update,
+        token_manager: TokenManager,
+        device_index=1,
+        ha_device_name="Zigma Air Purifier",
+        lat=None,
+        lon=None,
+    ):
         self.thing_name = thing_name
         self.sub_type = sub_type
         self.on_state_update = on_state_update
         self.token_manager = token_manager
+        self.device_index = device_index
+        self.ha_device_name = ha_device_name
         self.lat = lat
         self.lon = lon
         self.ws = None
@@ -240,27 +438,30 @@ class ZigmaClient:
     def connect(self):
         token = self.token_manager.get_token()
         if not token:
-            logger.error("Cannot connect: No JWT token available.")
+            logger.error("[Device #%d | %s] Cannot connect: No JWT token available.", self.device_index, self.thing_name)
             return False
 
         headers = {"token": token, "region": REGION}
         try:
-            logger.info("Connecting to Zigma Cloud WebSocket (%s)...", WSS_URL)
+            logger.info(
+                "[Device #%d | %s] Connecting to Zigma Cloud WebSocket (%s)...",
+                self.device_index,
+                self.thing_name,
+                WSS_URL,
+            )
             self.ws = websocket.create_connection(
                 WSS_URL,
                 header=headers,
                 sslopt={"cert_reqs": ssl.CERT_NONE},
                 timeout=10,
             )
-            logger.info("Connected to Zigma Cloud WebSocket.")
+            logger.info("[Device #%d | %s] Connected to Zigma Cloud WebSocket.", self.device_index, self.thing_name)
             self.sync_status()
             return True
         except Exception as e:
-            logger.error("Failed to connect to WebSocket: %s", e)
+            logger.error("[Device #%d | %s] Failed to connect to WebSocket: %s", self.device_index, self.thing_name, e)
             self.ws = None
-            if self.token_manager.account and self.token_manager.password:
-                self.token_manager.token_expiry = 0
-                self.token_manager.active_token = ""
+            self.token_manager.invalidate_token(token)
             return False
 
     def sync_status(self):
@@ -286,7 +487,6 @@ class ZigmaClient:
                             w = get_outdoor_weather(token, self.lat, self.lon, REGION)
                             if w and "pm2p5" in w:
                                 self.cached_outdoor_pm25 = w["pm2p5"]
-                                logger.info("Live Outdoor PM2.5 updated from weather service: %s µg/m³", self.cached_outdoor_pm25)
                             self.last_weather_check = now
                         except Exception as ex:
                             logger.debug("Weather query skipped: %s", ex)
@@ -297,13 +497,13 @@ class ZigmaClient:
                     self.current_state = status
                     self.on_state_update(status)
             except Exception as e:
-                logger.error("Error during sync_status: %s", e)
+                logger.error("[Device #%d | %s] Error during sync_status: %s", self.device_index, self.thing_name, e)
                 self.close()
 
     def send_command(self, updates: dict):
         with self.lock:
             if not self.ws and not self.connect():
-                logger.error("Cannot send command: WebSocket disconnected.")
+                logger.error("[Device #%d | %s] Cannot send command: WebSocket disconnected.", self.device_index, self.thing_name)
                 return False
 
             cmd_payload = {
@@ -321,7 +521,13 @@ class ZigmaClient:
                 "topic_payload": cmd_payload,
             }
             try:
-                logger.info("Sending command to purifier (%s): %s", self.thing_name, updates)
+                logger.info(
+                    "[Device #%d | %s | %s] Sending command to purifier: %s",
+                    self.device_index,
+                    self.ha_device_name,
+                    self.thing_name,
+                    updates,
+                )
                 self.ws.send(json.dumps(cmd))
                 time.sleep(0.5)
                 # Query device shadow to confirm updated state
@@ -341,7 +547,7 @@ class ZigmaClient:
                     self.on_state_update(status)
                 return True
             except Exception as e:
-                logger.error("Failed to send command: %s", e)
+                logger.error("[Device #%d | %s] Failed to send command: %s", self.device_index, self.thing_name, e)
                 self.close()
                 return False
 
@@ -363,80 +569,85 @@ class ZigmaClient:
             try:
                 self.sync_status()
             except Exception as e:
-                logger.warning("Sync failed: %s, reconnecting...", e)
+                logger.warning("[Device #%d | %s] Sync failed: %s, reconnecting...", self.device_index, self.thing_name, e)
                 self.close()
             time.sleep(SYNC_INTERVAL)
 
 
-class HomeAssistantBridge:
-    def __init__(self, thing_name, sub_type, nickname="Air Purifier", lat=None, lon=None):
+class PurifierDeviceHandler:
+    """Manages Home Assistant MQTT discovery, telemetry, and commands for a single purifier."""
+
+    def __init__(
+        self,
+        mqtt_client: mqtt.Client,
+        token_mgr: TokenManager,
+        thing_name: str,
+        sub_type: str,
+        nickname: str = "Air Purifier",
+        device_index: int = 1,
+        lat: float = None,
+        lon: float = None,
+    ):
+        self.mqtt_client = mqtt_client
         self.thing_name = thing_name
         self.sub_type = sub_type
         self.nickname = nickname
+        self.device_index = device_index
         self.lat = lat
         self.lon = lon
-        self.state_topic = f"{MQTT_TOPIC_PREFIX}/state"
-        self.availability_topic = f"{MQTT_TOPIC_PREFIX}/availability"
+
+        # Device #1 keeps exact original naming & topics so existing HA objects never change.
+        # Device #2+ gets suffixed with its number (e.g. " 2") as its own HA device & entities.
+        self.suffix = "" if self.device_index == 1 else f" {self.device_index}"
+        self.topic_prefix = MQTT_TOPIC_PREFIX if self.device_index == 1 else f"{MQTT_TOPIC_PREFIX}_{self.device_index}"
+        self.state_topic = f"{self.topic_prefix}/state"
+        self.availability_topic = f"{self.topic_prefix}/availability"
 
         clean_name = self.thing_name.replace("-", "_")
+        self.ha_device_name = f"Zigma {self.nickname}{self.suffix}"
         self.device_info = {
             "identifiers": [f"zigma_{clean_name}"],
-            "name": f"Zigma {self.nickname}",
+            "name": self.ha_device_name,
             "model": "Aerio 300",
             "manufacturer": "Zigma",
             "sw_version": "2.2.0.0108",
         }
 
-        self.mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-        if MQTT_USER:
-            self.mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-
-        self.mqtt_client.on_connect = self.on_mqtt_connect
-        self.mqtt_client.on_message = self.on_mqtt_message
-
-        self.token_mgr = TokenManager(
-            static_token=JWT_TOKEN,
-            account=ZIGMA_ACCOUNT,
-            password=ZIGMA_PASSWORD,
-            calling_code=ZIGMA_CALLING_CODE,
-        )
         self.zigma = ZigmaClient(
             thing_name=self.thing_name,
             sub_type=self.sub_type,
             on_state_update=self.publish_state,
-            token_manager=self.token_mgr,
+            token_manager=token_mgr,
+            device_index=self.device_index,
+            ha_device_name=self.ha_device_name,
             lat=self.lat,
-            lon=self.lon
+            lon=self.lon,
         )
 
-    def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
-        if rc == 0:
-            logger.info("Connected to MQTT broker successfully.")
-            self.publish_discovery()
-            self.mqtt_client.publish(self.availability_topic, "online", retain=True)
-            client.subscribe(f"{MQTT_TOPIC_PREFIX}/+/set")
-            logger.info("Subscribed to command topics: %s/+/set", MQTT_TOPIC_PREFIX)
-        else:
-            logger.error("Failed to connect to MQTT broker, rc=%s", rc)
-
     def publish_discovery(self):
-        logger.info("Publishing Home Assistant MQTT Auto-Discovery entities for %s...", self.thing_name)
+        logger.info(
+            "[Device #%d | %s] Publishing Home Assistant MQTT Auto-Discovery entities for %s (suffix='%s')...",
+            self.device_index,
+            self.ha_device_name,
+            self.thing_name,
+            self.suffix,
+        )
 
         fan_config = {
-            "name": self.nickname,
+            "name": f"{self.nickname}{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_fan",
             "state_topic": self.state_topic,
-            "command_topic": f"{MQTT_TOPIC_PREFIX}/power/set",
+            "command_topic": f"{self.topic_prefix}/power/set",
             "state_value_template": "{{ value_json.working_status | upper }}",
             "payload_on": "ON",
             "payload_off": "OFF",
             "percentage_state_topic": self.state_topic,
-            "percentage_command_topic": f"{MQTT_TOPIC_PREFIX}/speed/set",
+            "percentage_command_topic": f"{self.topic_prefix}/speed/set",
             "percentage_value_template": "{{ value_json.fan_level }}",
             "speed_range_min": 1,
             "speed_range_max": 3,
             "preset_mode_state_topic": self.state_topic,
-            "preset_mode_command_topic": f"{MQTT_TOPIC_PREFIX}/preset_mode/set",
+            "preset_mode_command_topic": f"{self.topic_prefix}/preset_mode/set",
             "preset_mode_value_template": "{% if value_json.sleep_mode == 'on' %}sleep{% elif value_json.fan_mode == 'auto' %}auto{% else %}manual{% endif %}",
             "preset_modes": ["manual", "auto", "sleep"],
             "availability_topic": self.availability_topic,
@@ -449,7 +660,7 @@ class HomeAssistantBridge:
         )
 
         pm25_config = {
-            "name": "PM2.5",
+            "name": f"PM2.5{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_pm25",
             "device_class": "pm25",
             "unit_of_measurement": "µg/m³",
@@ -466,7 +677,7 @@ class HomeAssistantBridge:
         )
 
         outdoor_pm25_config = {
-            "name": "Outdoor PM2.5",
+            "name": f"Outdoor PM2.5{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_outdoor_pm25",
             "device_class": "pm25",
             "unit_of_measurement": "µg/m³",
@@ -483,7 +694,7 @@ class HomeAssistantBridge:
         )
 
         filter_config = {
-            "name": "Filter Element Life",
+            "name": f"Filter Element Life{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_filter",
             "unit_of_measurement": "%",
             "icon": "mdi:air-filter",
@@ -499,7 +710,7 @@ class HomeAssistantBridge:
         )
 
         rpm_config = {
-            "name": "Fan Speed RPM",
+            "name": f"Fan Speed RPM{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_fan_speed",
             "unit_of_measurement": "RPM",
             "icon": "mdi:fan",
@@ -515,7 +726,7 @@ class HomeAssistantBridge:
         )
 
         lamp_config = {
-            "name": "Air Quality Indicator Lamp",
+            "name": f"Air Quality Indicator Lamp{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_round_lamp",
             "icon": "mdi:circle-color",
             "state_topic": self.state_topic,
@@ -530,11 +741,11 @@ class HomeAssistantBridge:
         )
 
         uv_config = {
-            "name": "UV Lamp",
+            "name": f"UV Lamp{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_uv_lamp",
             "icon": "mdi:weather-sunny-alert",
             "state_topic": self.state_topic,
-            "command_topic": f"{MQTT_TOPIC_PREFIX}/uv/set",
+            "command_topic": f"{self.topic_prefix}/uv/set",
             "value_template": "{{ value_json.uv_lamp | upper }}",
             "payload_on": "ON",
             "payload_off": "OFF",
@@ -548,11 +759,11 @@ class HomeAssistantBridge:
         )
 
         lock_config = {
-            "name": "Child Lock",
+            "name": f"Child Lock{self.suffix}",
             "unique_id": f"zigma_{self.thing_name}_child_lock",
             "icon": "mdi:lock",
             "state_topic": self.state_topic,
-            "command_topic": f"{MQTT_TOPIC_PREFIX}/lock/set",
+            "command_topic": f"{self.topic_prefix}/lock/set",
             "value_template": "{{ value_json.safe_lock | upper }}",
             "payload_on": "ON",
             "payload_off": "OFF",
@@ -565,7 +776,11 @@ class HomeAssistantBridge:
             retain=True,
         )
 
-        logger.info("Auto-Discovery entities published successfully.")
+        logger.info(
+            "[Device #%d | %s] Auto-Discovery entities published successfully.",
+            self.device_index,
+            self.ha_device_name,
+        )
 
     def publish_state(self, state: dict):
         # Normalize PM2.5 fields so both pm25 and air_pm25 are present
@@ -577,7 +792,9 @@ class HomeAssistantBridge:
         payload = json.dumps(state)
         self.mqtt_client.publish(self.state_topic, payload, retain=True)
         logger.info(
-            "Telemetry [%s]: Status=%s, Speed=%s RPM, Level=%s, PM2.5=%s, Outdoor PM2.5=%s, Filter=%s%%, UV=%s, Lock=%s",
+            "Telemetry [Device #%d | %s | %s]: Status=%s, Speed=%s RPM, Level=%s, PM2.5=%s, Outdoor PM2.5=%s, Filter=%s%%, UV=%s, Lock=%s",
+            self.device_index,
+            self.ha_device_name,
             self.thing_name,
             state.get("working_status"),
             state.get("fan_speed"),
@@ -589,16 +806,13 @@ class HomeAssistantBridge:
             state.get("safe_lock"),
         )
 
-    def on_mqtt_message(self, client, userdata, msg):
-        topic = msg.topic
-        payload = msg.payload.decode("utf-8").strip()
-        logger.info("Received MQTT message on %s: %s", topic, payload)
-
-        if topic == f"{MQTT_TOPIC_PREFIX}/power/set":
+    def handle_command(self, topic: str, payload: str) -> bool:
+        if topic == f"{self.topic_prefix}/power/set":
             cmd_val = "on" if payload.upper() == "ON" else "off"
             self.zigma.send_command({"working_status": cmd_val})
+            return True
 
-        elif topic == f"{MQTT_TOPIC_PREFIX}/speed/set":
+        if topic == f"{self.topic_prefix}/speed/set":
             try:
                 val = int(float(payload))
                 if val <= 0:
@@ -619,9 +833,10 @@ class HomeAssistantBridge:
                         "sleep_mode": "off",
                     })
             except ValueError:
-                logger.error("Invalid speed value: %s", payload)
+                logger.error("[Device #%d | %s] Invalid speed value: %s", self.device_index, self.thing_name, payload)
+            return True
 
-        elif topic == f"{MQTT_TOPIC_PREFIX}/preset_mode/set":
+        if topic == f"{self.topic_prefix}/preset_mode/set":
             mode = payload.lower()
             if mode == "sleep":
                 self.zigma.send_command({"working_status": "on", "sleep_mode": "on"})
@@ -629,17 +844,73 @@ class HomeAssistantBridge:
                 self.zigma.send_command({"working_status": "on", "sleep_mode": "off", "fan_mode": "auto"})
             elif mode == "manual":
                 self.zigma.send_command({"working_status": "on", "sleep_mode": "off", "fan_mode": "hand"})
+            return True
 
-        elif topic == f"{MQTT_TOPIC_PREFIX}/uv/set":
+        if topic == f"{self.topic_prefix}/uv/set":
             cmd_val = "on" if payload.upper() == "ON" else "off"
             self.zigma.send_command({"uv_lamp": cmd_val})
+            return True
 
-        elif topic == f"{MQTT_TOPIC_PREFIX}/lock/set":
+        if topic == f"{self.topic_prefix}/lock/set":
             cmd_val = "on" if payload.upper() == "ON" else "off"
             self.zigma.send_command({"safe_lock": cmd_val})
+            return True
+
+        return False
+
+
+class HomeAssistantBridge:
+    def __init__(self, devices: list, token_mgr: TokenManager):
+        self.token_mgr = token_mgr
+        self.mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        if MQTT_USER:
+            self.mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+
+        self.mqtt_client.on_connect = self.on_mqtt_connect
+        self.mqtt_client.on_message = self.on_mqtt_message
+
+        self.handlers = [
+            PurifierDeviceHandler(
+                mqtt_client=self.mqtt_client,
+                token_mgr=self.token_mgr,
+                thing_name=d["thing_name"],
+                sub_type=d["sub_type"],
+                nickname=d["nickname"],
+                device_index=d["index"],
+                lat=d.get("lat"),
+                lon=d.get("lon"),
+            )
+            for d in devices
+        ]
+
+    def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
+        if rc == 0:
+            logger.info("Connected to MQTT broker successfully. Registering %d device(s)...", len(self.handlers))
+            for handler in self.handlers:
+                handler.publish_discovery()
+                self.mqtt_client.publish(handler.availability_topic, "online", retain=True)
+                client.subscribe(f"{handler.topic_prefix}/+/set")
+                logger.info(
+                    "[Device #%d | %s | %s] Subscribed to command topics: %s/+/set",
+                    handler.device_index,
+                    handler.ha_device_name,
+                    handler.thing_name,
+                    handler.topic_prefix,
+                )
+        else:
+            logger.error("Failed to connect to MQTT broker, rc=%s", rc)
+
+    def on_mqtt_message(self, client, userdata, msg):
+        topic = msg.topic
+        payload = msg.payload.decode("utf-8").strip()
+        logger.info("Received MQTT message on %s: %s", topic, payload)
+
+        for handler in self.handlers:
+            if handler.handle_command(topic, payload):
+                return
 
     def run(self):
-        logger.info("Starting Zigma <-> Home Assistant Bridge...")
+        logger.info("Starting Zigma <-> Home Assistant Bridge for %d device(s)...", len(self.handlers))
         try:
             self.mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         except Exception as e:
@@ -647,72 +918,71 @@ class HomeAssistantBridge:
 
         self.mqtt_client.loop_start()
 
-        zigma_thread = threading.Thread(target=self.zigma.run_loop, daemon=True)
-        zigma_thread.start()
+        for handler in self.handlers:
+            t = threading.Thread(target=handler.zigma.run_loop, daemon=True)
+            t.start()
 
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Stopping bridge...")
-            self.mqtt_client.publish(self.availability_topic, "offline", retain=True)
+            for handler in self.handlers:
+                self.mqtt_client.publish(handler.availability_topic, "offline", retain=True)
+                handler.zigma.close()
             self.mqtt_client.loop_stop()
-            self.zigma.close()
+
+
+def log_device_assignments(devices: list):
+    logger.info("=" * 72)
+    logger.info("ZIGMA -> HOME ASSISTANT DEVICE ASSIGNMENTS (Persisted: %s)", DEVICE_MAP_PATH)
+    logger.info("-" * 72)
+    for d in devices:
+        idx = d["index"]
+        suffix = "" if idx == 1 else f" {idx}"
+        topic_prefix = MQTT_TOPIC_PREFIX if idx == 1 else f"{MQTT_TOPIC_PREFIX}_{idx}"
+        ha_dev_name = f"Zigma {d['nickname']}{suffix}"
+        role_label = "PRIMARY (existing HA names preserved)" if idx == 1 else f"SECONDARY #{idx} (suffixed with '{suffix}')"
+        logger.info(
+            "  Device #%d [%s]:",
+            idx,
+            role_label,
+        )
+        logger.info("    - Hardware Thing Name : %s", d["thing_name"])
+        logger.info("    - Zigma App Nickname  : %s", d["nickname"])
+        logger.info("    - HA Device Name      : %s (identifier: zigma_%s)", ha_dev_name, d["thing_name"].replace("-", "_"))
+        logger.info("    - HA Entity Names     : '%s%s', 'PM2.5%s', 'Outdoor PM2.5%s', 'UV Lamp%s', 'Child Lock%s', ...", d["nickname"], suffix, suffix, suffix, suffix, suffix)
+        logger.info("    - MQTT Topic Prefix   : %s", topic_prefix)
+        if d.get("lat") is not None and d.get("lon") is not None:
+            logger.info("    - Weather Coordinates : lat=%s, lon=%s", d["lat"], d["lon"])
+    logger.info("=" * 72)
 
 
 def main():
-    global THING_NAME, SUB_TYPE
+    configured_names = [n.strip() for n in THING_NAME.split(",") if n.strip()]
 
-    lat, lon = None, None
-    temp_mgr = TokenManager(
+    token_mgr = TokenManager(
         static_token=JWT_TOKEN,
         account=ZIGMA_ACCOUNT,
         password=ZIGMA_PASSWORD,
         calling_code=ZIGMA_CALLING_CODE,
     )
-    token = temp_mgr.get_token()
+    token = token_mgr.get_token()
 
+    discovered = []
     if token:
-        devices = auto_discover_things(token, REGION)
-        if devices:
-            if not THING_NAME:
-                matched = [
-                    d for d in devices
-                    if "aerio" in d.get("sub_type", "").lower() or "aerio" in d.get("thing_name", "").lower()
-                ]
-                chosen = matched[0] if matched else devices[0]
-                THING_NAME = chosen.get("thing_name")
-                SUB_TYPE = chosen.get("sub_type", "aerio-300")
-                nickname = chosen.get("thing_nickname", "Air Purifier")
-                logger.info(
-                    "Auto-discovered purifier: '%s' (Model: %s, Sub-Type: %s)",
-                    nickname,
-                    chosen.get("model"),
-                    SUB_TYPE,
-                )
-            else:
-                chosen = next((d for d in devices if d.get("thing_name") == THING_NAME), devices[0])
-                nickname = chosen.get("thing_nickname", "Air Purifier")
+        discovered = auto_discover_things(token, REGION)
+        if discovered:
+            logger.info("Discovered %d device(s) on Zigma account.", len(discovered))
 
-            coords = chosen.get("lng_lat", {})
-            try:
-                lat = float(coords.get("latitude"))
-                lon = float(coords.get("longitude"))
-                logger.info("Purifier coordinates for weather station: lat=%s, lon=%s", lat, lon)
-            except (TypeError, ValueError):
-                pass
-        else:
-            if not THING_NAME:
-                logger.error("No devices found on this Zigma account!")
-                sys.exit(1)
-            nickname = "Air Purifier"
-    else:
-        if not THING_NAME:
-            logger.error("Could not obtain JWT token or credentials to discover devices.")
-            sys.exit(1)
-        nickname = "Air Purifier"
+    devices = resolve_devices(discovered, configured_names)
+    if not devices:
+        logger.error("No devices found or configured on this Zigma account!")
+        sys.exit(1)
 
-    bridge = HomeAssistantBridge(thing_name=THING_NAME, sub_type=SUB_TYPE, nickname=nickname, lat=lat, lon=lon)
+    log_device_assignments(devices)
+
+    bridge = HomeAssistantBridge(devices=devices, token_mgr=token_mgr)
     bridge.run()
 
 

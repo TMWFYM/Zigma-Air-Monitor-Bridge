@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.4
+- Added multi-device support: automatically discovers and bridges all purifiers registered to the account.
+- Preserved exact Home Assistant device and entity names/topics for Device #1 so existing setups and automations remain unchanged.
+- Suffixed Device #2+ with its device number (e.g. `2`) as a separate Home Assistant device with its own controls and sensors.
+- Added persistent device index mapping (`/data/device_map.json`) and detailed startup assignment logging so device order changes from the cloud API across restarts never swap Home Assistant objects.
+
 ## 1.0.3
 - Fixed fan speed control: mapped discrete speed levels (1, 2, 3) and percentage inputs to purifier fan levels.
 - Updated Home Assistant MQTT fan percentage template to match configured `speed_range_min` and `speed_range_max`.

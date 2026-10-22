@@ -1,6 +1,6 @@
 name: "Zigma Aerio 300 Purifier"
 description: "Home Assistant MQTT bridge and real-time telemetry for Zigma Aerio 300 air purifiers"
-version: "1.0.3"
+version: "1.0.4"
 slug: "zigma_purifier"
 init: false
 arch:

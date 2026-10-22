@@ -3,6 +3,7 @@
 *.pem
 *.key
 *.token
+device_map.json
 
 # Python
 __pycache__/
