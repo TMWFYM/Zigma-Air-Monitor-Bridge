@@ -58,7 +58,7 @@ Supports both **Home Assistant OS / Supervised Add-on** and **Standalone Docker 
 6. Start the add-on and enable **Start on boot** and **Watchdog**.
 
 ### Method B: Local Add-on
-1. Copy the `zigma-purifier/` folder into your Home Assistant `/addons/` directory (e.g. `/addons/zigma-purifier`).
+1. Copy the `zigma-purifier/` folder into your Home Assistant `/local_apps/` directory (e.g. `/local_apps/zigma-purifier`).
 2. Go to **Settings** -> **Add-ons** -> **Add-on Store**, click the three dots, and select **Check for updates**.
 3. Install **Zigma Aerio 300 Purifier** under the Local Add-ons section.
 4. Fill in your Zigma credentials under the **Configuration** tab and start.
